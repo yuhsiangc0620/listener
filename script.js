@@ -64,6 +64,7 @@ function buildParticles() {
           x,
           y,
           norm,
+          angle: Math.atan2(dy, dx),
           phase: Math.random() * Math.PI * 2,
           speed: 1.8 + Math.random() * 3.5,
         });
@@ -140,7 +141,15 @@ function drawParticles(timestamp) {
   const globalBright = 1.0 + fs.peak * 0.24 + fs.rms * 0.12;
 
   for (const p of particles) {
-    const effectiveDist = p.norm / reachScale;
+    // Organic boundary: layered angular harmonics create a non-circular,
+    // slowly-shifting silhouette — like fire viewed from above.
+    const shapeWobble =
+      0.062 * Math.sin(p.angle * 3 + time * 0.48) +
+      0.038 * Math.sin(p.angle * 5 - time * 0.73) +
+      0.022 * Math.cos(p.angle * 8 + time * 0.31) +
+      0.014 * Math.sin(p.angle * 11 + time * 0.19);
+
+    const effectiveDist = p.norm / (reachScale * (1.0 + shapeWobble));
     if (effectiveDist > 1.04) continue;
 
     const t = clamp(effectiveDist);
@@ -163,7 +172,8 @@ function drawParticles(timestamp) {
     }
     if (alpha < 0.018) continue;
 
-    const dotR = DOT_BASE_RADIUS * lerp(1.18, 0.72, t) * (1 + fs.rms * 0.22);
+    // Steeper power-curve falloff: edge particles become much smaller than center.
+    const dotR = DOT_BASE_RADIUS * lerp(1.22, 0.22, Math.pow(t, 0.72)) * (1 + fs.rms * 0.22);
 
     ctx.beginPath();
     ctx.arc(p.x, p.y, Math.max(0.5, dotR), 0, Math.PI * 2);
