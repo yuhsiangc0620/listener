@@ -29,6 +29,21 @@ const fallback = {
   enabled: true,
 };
 
+const sessionState = {
+  id: createSessionId(),
+  startedAtIso: new Date().toISOString(),
+  startedAtMs: Date.now(),
+  sampleCount: 0,
+  rmsDbSum: 0,
+  peakMax: 0,
+  pitchVarianceHzSum: 0,
+  attackRateSum: 0,
+  silenceRatioSum: 0,
+  entropySum: 0,
+  hasRealAudio: false,
+  hasSubmitted: false,
+};
+
 // ── Canvas + Particles ────────────────────────────────────────
 const canvas = document.getElementById("flameCanvas");
 const ctx = canvas.getContext("2d");
@@ -111,6 +126,72 @@ function pushLimited(arr, val, size) {
   if (arr.length > size) arr.shift();
 }
 
+function createSessionId() {
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+  const suffix = Math.random().toString(36).slice(2, 8);
+  return `session_${stamp}_${suffix}`;
+}
+
+function round(value, digits = 4) {
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
+
+function accumulateSessionMetrics(metrics) {
+  sessionState.sampleCount += 1;
+  sessionState.rmsDbSum += metrics.rmsDb;
+  sessionState.peakMax = Math.max(sessionState.peakMax, metrics.peakMax);
+  sessionState.pitchVarianceHzSum += metrics.pitchVarianceHz;
+  sessionState.attackRateSum += metrics.attackRate;
+  sessionState.silenceRatioSum += metrics.silenceRatio;
+  sessionState.entropySum += metrics.entropy;
+}
+
+function buildSessionPayload() {
+  if (!sessionState.hasRealAudio || sessionState.sampleCount < 8) return null;
+
+  return {
+    sessionId: sessionState.id,
+    timestampStart: sessionState.startedAtIso,
+    sessionDurationSec: Math.max(1, Math.round((Date.now() - sessionState.startedAtMs) / 1000)),
+    energyRmsDb: round(sessionState.rmsDbSum / sessionState.sampleCount, 2),
+    energyPeakMax: round(sessionState.peakMax, 4),
+    pitchVarianceHz: round(sessionState.pitchVarianceHzSum / sessionState.sampleCount, 2),
+    pacingAttackRate: round(sessionState.attackRateSum / sessionState.sampleCount, 4),
+    silenceRatio: round(sessionState.silenceRatioSum / sessionState.sampleCount, 4),
+    calculatedEntropy: round(sessionState.entropySum / sessionState.sampleCount, 4),
+  };
+}
+
+async function submitSessionToNotion(useBeacon = false) {
+  if (sessionState.hasSubmitted) return;
+
+  const payload = buildSessionPayload();
+  if (!payload) return;
+
+  sessionState.hasSubmitted = true;
+
+  const body = JSON.stringify(payload);
+
+  if (useBeacon && navigator.sendBeacon) {
+    const blob = new Blob([body], { type: "application/json" });
+    const queued = navigator.sendBeacon("/api/notion-session", blob);
+    if (queued) return;
+  }
+
+  try {
+    await fetch("/api/notion-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: true,
+    });
+  } catch (error) {
+    sessionState.hasSubmitted = false;
+    console.error("Failed to persist session to Notion.", error);
+  }
+}
+
 function sampleGradient(t) {
   t = clamp(t);
   for (let i = 0; i < COLOR_STOPS.length - 1; i++) {
@@ -191,6 +272,8 @@ function analyzeAudio() {
   let peak = 0;
   let weightedFreq = 0;
   let freqEnergy = 0;
+  let weightedHz = 0;
+  let weightedHzSq = 0;
 
   for (let i = 0; i < timeData.length; i++) {
     const n = (timeData[i] - 128) / 128;
@@ -199,14 +282,25 @@ function analyzeAudio() {
     if (a > peak) peak = a;
   }
 
+  const nyquist = audioContext ? audioContext.sampleRate / 2 : 22050;
+  const hzPerBin = nyquist / freqData.length;
+
   for (let i = 0; i < freqData.length; i++) {
     const m = freqData[i] / 255;
+    const hz = i * hzPerBin;
     weightedFreq += m * i;
     freqEnergy += m;
+    weightedHz += m * hz;
+    weightedHzSq += m * hz * hz;
   }
 
   const rms = Math.sqrt(rmsSum / timeData.length);
   const centroid = freqEnergy > 0 ? weightedFreq / (freqEnergy * freqData.length) : 0;
+  const centroidHz = freqEnergy > 0 ? weightedHz / freqEnergy : 0;
+  const pitchVarianceHz = freqEnergy > 0
+    ? Math.sqrt(Math.max(0, weightedHzSq / freqEnergy - centroidHz * centroidHz))
+    : 0;
+  const rmsDb = rms > 0.0001 ? 20 * Math.log10(rms) : -80;
 
   const prevRms = history.rms.length ? history.rms[history.rms.length - 1] : rms;
   const attack = clamp((rms - prevRms) * 12 + peak * 0.2);
@@ -229,6 +323,15 @@ function analyzeAudio() {
   featureState.attackRate = lerp(featureState.attackRate, attackRate, 0.2);
   featureState.silenceRatio = lerp(featureState.silenceRatio, silenceRatio, 0.08);
   featureState.entropy = lerp(featureState.entropy, entropy, 0.14);
+
+  accumulateSessionMetrics({
+    rmsDb,
+    peakMax: peak,
+    pitchVarianceHz,
+    attackRate: featureState.attackRate,
+    silenceRatio: featureState.silenceRatio,
+    entropy: featureState.entropy,
+  });
 }
 
 function runFallback(deltaSeconds) {
@@ -263,6 +366,7 @@ async function setupMicrophone() {
     sourceNode = audioContext.createMediaStreamSource(stream);
     sourceNode.connect(analyser);
     fallback.enabled = false;
+    sessionState.hasRealAudio = true;
   } catch {
     fallback.enabled = true;
   }
@@ -300,6 +404,14 @@ window.addEventListener("visibilitychange", () => {
   } else if (!document.hidden && audioContext?.state === "suspended") {
     audioContext.resume();
   }
+});
+
+window.addEventListener("pagehide", () => {
+  submitSessionToNotion(true);
+});
+
+window.addEventListener("beforeunload", () => {
+  submitSessionToNotion(true);
 });
 
 bindGestureToMic();
