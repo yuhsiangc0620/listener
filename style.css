@@ -1,0 +1,32 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  background: #020202;
+  overflow: hidden;
+}
+
+body {
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.scene {
+  width: 100%;
+  height: 100vh;
+  height: 100svh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#flameCanvas {
+  display: block;
+  filter: drop-shadow(0 0 56px rgba(255, 110, 20, 0.22));
+}
