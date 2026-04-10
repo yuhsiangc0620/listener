@@ -29,8 +29,27 @@ const fallback = {
   enabled: true,
 };
 
+const USER_ID_STORAGE_KEY = "listener.userId";
+const BASE_FIELD_RADIUS_SCALE = 0.46;
+const BASE_SHAPE_AMPLITUDE = 0.136;
+
+const DEFAULT_FLAME_PROFILE = Object.freeze({
+  sizeScale: 1,
+  edgeParticleScale: 0.22,
+  shapeAmplitude: BASE_SHAPE_AMPLITUDE,
+  shapeFrequencyBias: 1,
+  warmthBias: 0,
+  sampleCount: 0,
+  source: "default",
+  updatedAt: null,
+});
+
+const userId = getOrCreateUserId();
+let learnedProfile = loadLearnedProfile();
+
 const sessionState = {
   id: createSessionId(),
+  userId,
   startedAtIso: new Date().toISOString(),
   startedAtMs: Date.now(),
   sampleCount: 0,
@@ -99,7 +118,7 @@ function resizeCanvas() {
   canvasSize = logical;
   centerX = logical / 2;
   centerY = logical / 2;
-  fieldRadius = logical * 0.46;
+  fieldRadius = logical * BASE_FIELD_RADIUS_SCALE * learnedProfile.sizeScale;
   buildParticles();
 }
 
@@ -132,9 +151,75 @@ function createSessionId() {
   return `session_${stamp}_${suffix}`;
 }
 
+function createUserId() {
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+  const suffix = Math.random().toString(36).slice(2, 10);
+  return `user_${stamp}_${suffix}`;
+}
+
+function getOrCreateUserId() {
+  try {
+    const stored = window.localStorage.getItem(USER_ID_STORAGE_KEY);
+    if (stored) return stored;
+
+    const next = createUserId();
+    window.localStorage.setItem(USER_ID_STORAGE_KEY, next);
+    return next;
+  } catch {
+    return createUserId();
+  }
+}
+
+function getProfileStorageKey(id) {
+  return `listener.flameProfile.${id}`;
+}
+
 function round(value, digits = 4) {
   const factor = 10 ** digits;
   return Math.round(value * factor) / factor;
+}
+
+function finiteNumberOr(value, fallback) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function normalizeFlameProfile(input = {}) {
+  return {
+    ...DEFAULT_FLAME_PROFILE,
+    sizeScale: clamp(finiteNumberOr(input.sizeScale, DEFAULT_FLAME_PROFILE.sizeScale), 0.8, 1.25),
+    edgeParticleScale: clamp(finiteNumberOr(input.edgeParticleScale, DEFAULT_FLAME_PROFILE.edgeParticleScale), 0.12, 0.5),
+    shapeAmplitude: clamp(finiteNumberOr(input.shapeAmplitude, DEFAULT_FLAME_PROFILE.shapeAmplitude), 0.02, 0.16),
+    shapeFrequencyBias: clamp(finiteNumberOr(input.shapeFrequencyBias, DEFAULT_FLAME_PROFILE.shapeFrequencyBias), 0.85, 1.25),
+    warmthBias: clamp(finiteNumberOr(input.warmthBias, DEFAULT_FLAME_PROFILE.warmthBias), -0.2, 0.3),
+    sampleCount: Math.max(0, finiteNumberOr(input.sampleCount, 0)),
+    source: typeof input.source === "string" ? input.source : DEFAULT_FLAME_PROFILE.source,
+    updatedAt: typeof input.updatedAt === "string" ? input.updatedAt : null,
+  };
+}
+
+function loadLearnedProfile() {
+  try {
+    const raw = window.localStorage.getItem(getProfileStorageKey(userId));
+    if (!raw) return { ...DEFAULT_FLAME_PROFILE };
+    return normalizeFlameProfile(JSON.parse(raw));
+  } catch {
+    return { ...DEFAULT_FLAME_PROFILE };
+  }
+}
+
+function persistLearnedProfile(profile) {
+  learnedProfile = normalizeFlameProfile(profile);
+  try {
+    window.localStorage.setItem(getProfileStorageKey(userId), JSON.stringify(learnedProfile));
+  } catch {
+    // Ignore storage failures and keep runtime profile only.
+  }
+}
+
+function applyLearnedProfile(profile) {
+  persistLearnedProfile(profile);
+  resizeCanvas();
 }
 
 function accumulateSessionMetrics(metrics) {
@@ -152,6 +237,7 @@ function buildSessionPayload() {
 
   return {
     sessionId: sessionState.id,
+    userId: sessionState.userId,
     timestampStart: sessionState.startedAtIso,
     sessionDurationSec: Math.max(1, Math.round((Date.now() - sessionState.startedAtMs) / 1000)),
     energyRmsDb: round(sessionState.rmsDbSum / sessionState.sampleCount, 2),
@@ -180,15 +266,35 @@ async function submitSessionToNotion(useBeacon = false) {
   }
 
   try {
-    await fetch("/api/notion-session", {
+    const response = await fetch("/api/notion-session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
       keepalive: true,
     });
+
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(result?.error || "Failed to persist session.");
+    }
+
+    if (result?.profile) {
+      applyLearnedProfile(result.profile);
+    }
   } catch (error) {
     sessionState.hasSubmitted = false;
     console.error("Failed to persist session to Notion.", error);
+  }
+}
+
+async function refreshLearnedProfile() {
+  try {
+    const response = await fetch(`/api/flame-profile?userId=${encodeURIComponent(userId)}`);
+    const result = await response.json().catch(() => null);
+    if (!response.ok || !result?.profile) return;
+    applyLearnedProfile(result.profile);
+  } catch (error) {
+    console.warn("Failed to refresh learned flame profile.", error);
   }
 }
 
@@ -218,17 +324,19 @@ function drawParticles(timestamp) {
 
   const energyBoost = fs.rms * 0.52 + fs.peak * 0.26 + fs.entropy * 0.08;
   const reachScale = 0.50 + energyBoost * 0.74;
-  const heatShift = fs.centroid * 0.35;
+  const heatShift = fs.centroid * 0.35 + learnedProfile.warmthBias;
   const globalBright = 1.0 + fs.peak * 0.24 + fs.rms * 0.12;
+  const shapeAmplitudeScale = learnedProfile.shapeAmplitude / BASE_SHAPE_AMPLITUDE;
+  const shapeFrequencyBias = learnedProfile.shapeFrequencyBias;
 
   for (const p of particles) {
     // Organic boundary: layered angular harmonics create a non-circular,
     // slowly-shifting silhouette — like fire viewed from above.
     const shapeWobble =
-      0.062 * Math.sin(p.angle * 3 + time * 0.48) +
-      0.038 * Math.sin(p.angle * 5 - time * 0.73) +
-      0.022 * Math.cos(p.angle * 8 + time * 0.31) +
-      0.014 * Math.sin(p.angle * 11 + time * 0.19);
+      0.062 * shapeAmplitudeScale * Math.sin(p.angle * 3 * shapeFrequencyBias + time * 0.48) +
+      0.038 * shapeAmplitudeScale * Math.sin(p.angle * 5 * shapeFrequencyBias - time * 0.73) +
+      0.022 * shapeAmplitudeScale * Math.cos(p.angle * 8 * shapeFrequencyBias + time * 0.31) +
+      0.014 * shapeAmplitudeScale * Math.sin(p.angle * 11 * shapeFrequencyBias + time * 0.19);
 
     const effectiveDist = p.norm / (reachScale * (1.0 + shapeWobble));
     if (effectiveDist > 1.04) continue;
@@ -254,7 +362,10 @@ function drawParticles(timestamp) {
     if (alpha < 0.018) continue;
 
     // Steeper power-curve falloff: edge particles become much smaller than center.
-    const dotR = DOT_BASE_RADIUS * lerp(1.22, 0.22, Math.pow(t, 0.72)) * (1 + fs.rms * 0.22);
+    const dotR = DOT_BASE_RADIUS
+      * learnedProfile.sizeScale
+      * lerp(1.22, learnedProfile.edgeParticleScale, Math.pow(t, 0.72))
+      * (1 + fs.rms * 0.22);
 
     ctx.beginPath();
     ctx.arc(p.x, p.y, Math.max(0.5, dotR), 0, Math.PI * 2);
@@ -415,4 +526,5 @@ window.addEventListener("beforeunload", () => {
 });
 
 bindGestureToMic();
+refreshLearnedProfile();
 requestAnimationFrame(tick);
